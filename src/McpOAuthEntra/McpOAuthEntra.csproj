@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>McpOAuthEntra</RootNamespace>
+    <UserSecretsId>b3f2a1c4-9d8e-4f7a-b6c5-d2e1f0a3b4c5</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      JwtBearer ships as a NuGet package even for ASP.NET Core projects.
+      Pin to the major that matches your target framework.
+    -->
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="9.*" />
+    <!--
+      The MCP C# SDK is still pre-release. Use *-* to resolve to the latest
+      pre-release version, or pin to a specific version found at:
+      https://www.nuget.org/packages/ModelContextProtocol.AspNetCore
+    -->
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="*-*" />
+  </ItemGroup>
+
+</Project>

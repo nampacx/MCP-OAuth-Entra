@@ -1,0 +1,31 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.swp
+*.DS_Store
+
+## NuGet
+*.nupkg
+.nuget/
+
+## Publishing
+publish/
+*.pubxml
+*.pubxml.user
+
+## Secrets (never commit)
+appsettings.local.json
+appsettings.Development.json
+*secrets*
+
+## Azure
+.azure/
+
+## Bicep / ARM cache
+.bicep/
+app.zip
+.claude/settings.local.json
+/.vscode
