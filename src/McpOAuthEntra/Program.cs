@@ -1,4 +1,3 @@
-using McpOAuthEntra.AuthProxy;
 using McpOAuthEntra.Tools;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
@@ -46,7 +45,6 @@ builder.Services
 
 builder.Services.AddAuthorization();
 builder.Services.AddHttpContextAccessor();
-builder.Services.AddHttpClient();
 
 // ── MCP server ───────────────────────────────────────────────────────────────
 builder.Services
@@ -60,7 +58,18 @@ app.UseHttpsRedirection();
 app.UseAuthentication();
 app.UseAuthorization();
 
-app.MapAuthProxy();
+// ── RFC 9728 — OAuth 2.0 Protected Resource Metadata ─────────────────────────
+// Advertises the Entra ID authorization server so MCP clients can perform
+// automatic OAuth discovery after receiving the 401 challenge.
+var prmDocument = new
+{
+    resource                 = $"api://{clientId}",
+    authorization_servers    = new[] { $"{instance}/{tenantId}/v2.0" },
+    bearer_methods_supported = new[] { "header" },
+    scopes_supported         = new[] { $"api://{clientId}/user_impersonation" }
+};
+app.MapGet("/.well-known/oauth-protected-resource", () => Results.Ok(prmDocument));
+
 app.MapMcp("/mcp").RequireAuthorization();
 
 app.Run();

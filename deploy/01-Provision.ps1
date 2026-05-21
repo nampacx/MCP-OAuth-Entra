@@ -16,6 +16,7 @@
          ClientId and TenantId are injected as parameter overrides — no need
          to edit iac/main.bicepparam manually before running this script.
     7.  Register https://<appservice>/callback (production redirect URI)
+    8.  (Optional) Deploy Azure AI Foundry Hub + Project to swedencentral
 
     The script is idempotent — safe to re-run after partial failures.
 
@@ -36,35 +37,49 @@
 
 .PARAMETER SignInAudience
     Entra ID sign-in audience for the app registration.
+
+.PARAMETER DeployFoundry
+    When set, also deploys an Azure AI Foundry Hub and Project to swedencentral,
+    which provides the widest model coverage for Identity Passthrough testing.
+
+.PARAMETER FoundryResourceGroup
+    Resource group for the Foundry resources. Defaults to <ResourceGroup>-ai.
 #>
 
 [CmdletBinding()]
 param(
-    [string] $DisplayName       = 'MCP OAuth Entra',
-    [string] $ResourceGroup     = 'rg-mcp-oauth-entra',
-    [string] $Location          = 'westeurope',
-    [string] $AppName           = 'mcp-entra',
-    [string] $AppServicePlanSku = 'B1',
-    [string] $SignInAudience    = 'AzureADMyOrg'
+    [string] $DisplayName          = 'MCP OAuth Entra',
+    [string] $ResourceGroup        = 'rg-mcp-oauth-entra',
+    [string] $Location             = 'westeurope',
+    [string] $AppName              = 'npx-mcp-entra',
+    [string] $AppServicePlanSku    = 'B1',
+    [string] $SignInAudience       = 'AzureADMyOrg',
+    [switch] $DeployFoundry,
+    [string] $FoundryResourceGroup = ''
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+. "$PSScriptRoot\_Shared.ps1"
 
-$repoRoot   = Resolve-Path "$PSScriptRoot\.."
-$bicepFile  = Join-Path $repoRoot 'iac\main.bicep'
-$paramsFile = Join-Path $repoRoot 'iac\main.bicepparam'
+if (-not $FoundryResourceGroup) { $FoundryResourceGroup = "$ResourceGroup-ai" }
+
+$instance = 'https://login.microsoftonline.com'
+
+$repoRoot         = Resolve-Path "$PSScriptRoot\.."
+$bicepFile        = Join-Path $repoRoot 'iac\main.bicep'
+$paramsFile       = Join-Path $repoRoot 'iac\main.bicepparam'
+$foundryBicepFile = Join-Path $repoRoot 'iac\foundry.bicep'
 
 if (-not (Test-Path $bicepFile))  { throw "Bicep template not found: $bicepFile"  }
 if (-not (Test-Path $paramsFile)) { throw "Parameter file not found: $paramsFile" }
+if ($DeployFoundry -and -not (Test-Path $foundryBicepFile)) {
+    throw "Foundry Bicep template not found: $foundryBicepFile"
+}
 
-function Write-Step([string] $msg) { Write-Host "`n[$msg]" -ForegroundColor Cyan }
-function Write-OK  ([string] $msg) { Write-Host "      $msg" -ForegroundColor Green }
-function Write-Skip([string] $msg) { Write-Host "      $msg" -ForegroundColor Yellow }
+$totalSteps = if ($DeployFoundry) { 6 } else { 5 }
 
 # ── 1. Create / update app registration ──────────────────────────────────────
 
-Write-Step '1/7  Creating / updating Entra ID app registration'
+Write-Step "1/$totalSteps  Creating / updating Entra ID app registration"
 
 $app = az ad app create `
     --display-name $DisplayName `
@@ -79,10 +94,10 @@ Write-OK "ClientId = $clientId   TenantId = $tenantId"
 
 # ── 2. Configure token version, optional claims, Graph permissions ────────────
 
-Write-Step '2/7  Configuring token version, optional claims, and Graph permissions'
+Write-Step "2/$totalSteps  Configuring token version, optional claims, and Graph permissions"
 
-$graphToken  = az account get-access-token --resource 'https://graph.microsoft.com' --query accessToken -o tsv
-$graphUri    = "https://graph.microsoft.com/v1.0/applications/$objectId"
+$graphToken   = az account get-access-token --resource 'https://graph.microsoft.com' --query accessToken -o tsv
+$graphUri     = "https://graph.microsoft.com/v1.0/applications/$objectId"
 $graphHeaders = @{ Authorization = "Bearer $graphToken" }
 
 az ad app update --id $clientId --identifier-uris "api://$clientId" | Out-Null
@@ -115,7 +130,7 @@ Write-OK 'Token v2, optional claims (given_name, family_name, upn), Graph openid
 
 # ── 3. Expose user_impersonation scope ────────────────────────────────────────
 
-Write-Step '3/7  Exposing user_impersonation delegated scope'
+Write-Step "3/$totalSteps  Exposing user_impersonation delegated scope"
 
 $currentApp    = Invoke-RestMethod -Method GET -Uri $graphUri -Headers $graphHeaders
 $existingScope = $currentApp.api.oauth2PermissionScopes |
@@ -153,7 +168,7 @@ else {
 
 # ── 4. Pre-authorize the Azure CLI ────────────────────────────────────────────
 
-Write-Step '4/7  Pre-authorizing the Azure CLI'
+Write-Step "4/$totalSteps  Pre-authorizing the Azure CLI"
 
 # Well-known Azure CLI app ID (constant across all tenants).
 $azureCliAppId  = '04b07795-8ddb-461a-bbee-02f9e1bf7b46'
@@ -182,37 +197,9 @@ else {
     Write-OK 'Azure CLI pre-authorized — no consent prompt needed for local testing.'
 }
 
-# ── 5. Register localhost redirect URI ────────────────────────────────────────
+# ── 5. Create resource group and deploy Bicep ─────────────────────────────────
 
-Write-Step '5/7  Registering http://localhost:5000/callback redirect URI'
-
-function Add-RedirectUri([string[]] $urisToAdd) {
-    $app      = Invoke-RestMethod -Method GET -Uri $graphUri -Headers $graphHeaders
-    $existing = @($app.publicClient.redirectUris)
-    $missing  = @($urisToAdd | Where-Object { $_ -notin $existing })
-
-    if ($missing.Count -eq 0) {
-        Write-Skip 'All redirect URIs already registered — skipping.'
-        return
-    }
-
-    $updated = @($existing + $missing | Sort-Object -Unique)
-    $body    = @{
-        isFallbackPublicClient = $true
-        publicClient           = @{ redirectUris = $updated }
-    } | ConvertTo-Json -Depth 3
-
-    Invoke-RestMethod -Method PATCH -Uri $graphUri -Headers $graphHeaders `
-        -ContentType 'application/json' -Body $body | Out-Null
-
-    Write-OK "Registered: $($missing -join ', ')"
-}
-
-Add-RedirectUri 'http://localhost:5000/callback'
-
-# ── 6. Create resource group and deploy Bicep ─────────────────────────────────
-
-Write-Step "6/7  Deploying Azure infrastructure to '$ResourceGroup' ($Location)"
+Write-Step "5/$totalSteps  Deploying Azure infrastructure to '$ResourceGroup' ($Location)"
 
 az group create --name $ResourceGroup --location $Location | Out-Null
 
@@ -223,7 +210,8 @@ az deployment group create `
     --template-file  $bicepFile `
     --parameters     $paramsFile `
     --parameters     "tenantId=$tenantId" "clientId=$clientId" `
-                     "appName=$AppName"   "appServicePlanSku=$AppServicePlanSku"
+                     "appName=$AppName"   "appServicePlanSku=$AppServicePlanSku" `
+    -o none
 
 $outputs = az deployment group show `
     --resource-group $ResourceGroup `
@@ -232,14 +220,32 @@ $outputs = az deployment group show `
     -o json `
     | ConvertFrom-Json
 
-$hostname = $outputs.webAppHostname.value
-Write-OK "App Service deployed: $hostname"
+Write-OK "App Service deployed: $($outputs.webAppHostname.value)"
 
-# ── 7. Register Azure App Service redirect URI ────────────────────────────────
+# ── 6. Deploy Azure AI Foundry (optional) ─────────────────────────────────────
 
-Write-Step '7/7  Registering Azure App Service callback redirect URI'
+if ($DeployFoundry) {
+    Write-Step "6/$totalSteps  Deploying Azure AI Foundry to '$FoundryResourceGroup' (swedencentral)"
 
-Add-RedirectUri "https://$hostname/callback"
+    az group create --name $FoundryResourceGroup --location swedencentral | Out-Null
+
+    az deployment group create `
+        --resource-group $FoundryResourceGroup `
+        --name           foundry `
+        --template-file  $foundryBicepFile `
+        --parameters     "appName=$AppName" `
+        -o none
+
+    $foundryOutputs = az deployment group show `
+        --resource-group $FoundryResourceGroup `
+        --name           foundry `
+        --query          'properties.outputs' `
+        -o json `
+        | ConvertFrom-Json
+
+    Write-OK "Foundry : $($foundryOutputs.foundryName.value)"
+    Write-OK "Project : $($foundryOutputs.projectName.value)"
+}
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
@@ -252,10 +258,27 @@ Write-Host "    ClientId  : $clientId"
 Write-Host "    Scope     : api://$clientId/user_impersonation"
 Write-Host ''
 Write-Host '  Azure'
-Write-Host "    Resource Group : $ResourceGroup"
-Write-Host "    MCP endpoint : $($outputs.mcpEndpointUrl.value)"
-Write-Host "    PRM URL      : $($outputs.prmUrl.value)"
-Write-Host "    App name     : $($outputs.webAppName.value)"
+Write-Host "    Resource group : $ResourceGroup ($Location)"
+Write-Host "    App name       : $($outputs.webAppName.value)"
+Write-Host ''
+Write-Host '  Endpoints'
+Write-Host "    MCP            : $($outputs.mcpEndpointUrl.value)"
+Write-Host "    PRM            : $($outputs.prmUrl.value)"
+if ($DeployFoundry) {
+    Write-Host ''
+    Write-Host '  Azure AI Foundry (swedencentral)'
+    Write-Host "    Resource group : $FoundryResourceGroup"
+    Write-Host "    Foundry        : $($foundryOutputs.foundryName.value)"
+    Write-Host "    Project        : $($foundryOutputs.projectName.value)"
+    Write-Host "    Portal         : https://ai.azure.com"
+}
+Write-Host ''
+Write-Host '  Foundry connection — OAuth Identity Passthrough'
+Write-Host "    Client ID    : $clientId"
+Write-Host "    Auth URL     : $instance/$tenantId/oauth2/v2.0/authorize"
+Write-Host "    Token URL    : $instance/$tenantId/oauth2/v2.0/token"
+Write-Host "    Refresh URL  : $instance/$tenantId/oauth2/v2.0/token"
+Write-Host "    Scopes       : api://$clientId/user_impersonation"
 Write-Host ''
 Write-Host '  Local development — set user-secrets:'
 Write-Host "    dotnet user-secrets set ""AzureAd:TenantId"" ""$tenantId"" --project src/McpOAuthEntra"

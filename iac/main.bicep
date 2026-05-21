@@ -31,7 +31,7 @@ param tenantId string
 param clientId string
 
 @description('Entra ID authority instance URL.')
-param instance string = 'https://login.microsoftonline.com/'
+param instance string = environment().authentication.loginEndpoint
 
 @description('Optional resource tags applied to all resources.')
 param tags object = {}
@@ -107,4 +107,4 @@ output mcpEndpointUrl string = 'https://${webApp.outputs.defaultHostname}/mcp'
 output prmUrl string = 'https://${webApp.outputs.defaultHostname}/.well-known/oauth-protected-resource'
 
 @description('Principal ID of the system-assigned managed identity.')
-output managedIdentityPrincipalId string = webApp.outputs.systemAssignedMIPrincipalId
+output managedIdentityPrincipalId string = webApp.outputs.?systemAssignedMIPrincipalId ?? ''

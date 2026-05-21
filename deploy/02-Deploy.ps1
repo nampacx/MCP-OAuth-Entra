@@ -23,8 +23,7 @@ param(
     [switch] $SkipBuild
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+. "$PSScriptRoot\_Shared.ps1"
 
 $repoRoot    = Resolve-Path "$PSScriptRoot\.."
 $projectFile = Join-Path $repoRoot 'src\McpOAuthEntra\McpOAuthEntra.csproj'
@@ -34,7 +33,7 @@ $zipPath     = Join-Path $repoRoot 'app.zip'
 # ── 1. Build ──────────────────────────────────────────────────────────────────
 
 if (-not $SkipBuild) {
-    Write-Host "`n[1/4] Building and publishing in Release mode..." -ForegroundColor Cyan
+    Write-Step "1/4  Building and publishing in Release mode"
 
     if (-not (Test-Path $projectFile)) { throw "Project file not found: $projectFile" }
     if (Test-Path $publishDir) { Remove-Item $publishDir -Recurse -Force }
@@ -42,41 +41,43 @@ if (-not $SkipBuild) {
     dotnet publish $projectFile -c Release -o $publishDir
     if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed (exit code $LASTEXITCODE)." }
 
-    Write-Host "      Build succeeded." -ForegroundColor Green
+    Write-OK 'Build succeeded.'
 }
 else {
-    Write-Host "`n[1/4] Skipping build — using existing '$publishDir'." -ForegroundColor Yellow
+    Write-Step "1/4  Skipping build"
+    Write-Skip "Reusing existing '$publishDir'."
     if (-not (Test-Path $publishDir)) { throw "Publish folder not found: $publishDir" }
 }
 
 # ── 2. Package ────────────────────────────────────────────────────────────────
 
-Write-Host "`n[2/4] Creating deployment package..." -ForegroundColor Cyan
+Write-Step '2/4  Creating deployment package'
 
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 Compress-Archive -Path "$publishDir\*" -DestinationPath $zipPath
 
-Write-Host "      Package created." -ForegroundColor Green
+Write-OK 'Package created.'
 
 # ── 3. Resolve App Service name ───────────────────────────────────────────────
 
-Write-Host "`n[3/4] Resolving App Service name from deployment outputs..." -ForegroundColor Cyan
+Write-Step '3/4  Resolving App Service name from deployment outputs'
 
-$appName = az deployment group show `
+$outputs = az deployment group show `
     --resource-group $ResourceGroup `
     --name           main `
-    --query          'properties.outputs.webAppName.value' `
-    -o tsv
+    --query          'properties.outputs' `
+    -o json | ConvertFrom-Json
 
-if ([string]::IsNullOrWhiteSpace($appName)) {
+if ([string]::IsNullOrWhiteSpace($outputs.webAppName.value)) {
     throw "Could not read webAppName from deployment outputs. Run 01-Provision.ps1 first."
 }
 
-Write-Host "      App Service: $appName" -ForegroundColor Green
+$appName = $outputs.webAppName.value
+Write-OK "App Service: $appName"
 
 # ── 4. Deploy ─────────────────────────────────────────────────────────────────
 
-Write-Host "`n[4/4] Deploying to '$appName'..." -ForegroundColor Cyan
+Write-Step "4/4  Deploying to '$appName'"
 
 az webapp deploy `
     --resource-group $ResourceGroup `
@@ -84,16 +85,9 @@ az webapp deploy `
     --src-path       $zipPath `
     --type           zip
 
-Write-Host "      Deployment complete." -ForegroundColor Green
+Write-OK 'Deployment complete.'
 
 # ── Summary ───────────────────────────────────────────────────────────────────
-
-$outputs = az deployment group show `
-    --resource-group $ResourceGroup `
-    --name           main `
-    --query          'properties.outputs' `
-    -o json `
-    | ConvertFrom-Json
 
 Write-Host ''
 Write-Host '  MCP server is live:' -ForegroundColor Green
