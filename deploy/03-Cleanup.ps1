@@ -31,7 +31,7 @@
 
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [string] $ResourceGroup        = 'rg-mcp-oauth-entra',
+    [string] $ResourceGroup        = 'rg-npx-mcp-oauth-entra',
     [string] $FoundryResourceGroup = '',
     [string] $AppName              = 'mcp-entra',
     [string] $DisplayName          = 'MCP OAuth Entra',
@@ -111,23 +111,59 @@ else {
     Write-Skip 'Nothing to purge.'
 }
 
-# ── 4. Delete main resource group ─────────────────────────────────────────────
+# ── 4. Collect Key Vault name before deletion ──────────────────────────────────
 
-Write-Step '4  Deleting main resource group'
+Write-Step '4  Collecting Key Vault info'
+
+$keyVault = $null
 
 $mainRgExists = az group exists --name $ResourceGroup | ConvertFrom-Json
 if ($mainRgExists) {
-    az group delete --name $ResourceGroup --yes
-    Write-OK "Deleted '$ResourceGroup'."
+    $keyVault = az resource list `
+        --resource-group $ResourceGroup `
+        --resource-type  'Microsoft.KeyVault/vaults' `
+        --query          '[0].{name:name, location:location}' `
+        -o json | ConvertFrom-Json
+
+    if ($keyVault) {
+        Write-OK "Found Key Vault '$($keyVault.name)' in $($keyVault.location)."
+    }
+    else {
+        Write-Skip 'No Key Vault found in main resource group.'
+    }
 }
 else {
     Write-Skip "Resource group '$ResourceGroup' does not exist — skipping."
 }
 
-# ── 5. Delete Entra ID app registration (optional) ────────────────────────────
+# ── 5. Delete main resource group ─────────────────────────────────────────────
+
+Write-Step '5  Deleting main resource group'
+
+if ($mainRgExists) {
+    az group delete --name $ResourceGroup --yes
+    Write-OK "Deleted '$ResourceGroup'."
+}
+else {
+    Write-Skip 'Already gone.'
+}
+
+# ── 6. Purge soft-deleted Key Vault ───────────────────────────────────────────
+
+Write-Step '6  Purging soft-deleted Key Vault'
+
+if ($keyVault) {
+    az keyvault purge --name $keyVault.name --location $keyVault.location --no-wait
+    Write-OK "Purged '$($keyVault.name)'."
+}
+else {
+    Write-Skip 'Nothing to purge.'
+}
+
+# ── 7. Delete Entra ID app registration (optional) ────────────────────────────
 
 if ($DeleteEntraApp) {
-    Write-Step '5  Deleting Entra ID app registration'
+    Write-Step '7  Deleting Entra ID app registration'
 
     $apps = az ad app list --display-name $DisplayName -o json | ConvertFrom-Json
 

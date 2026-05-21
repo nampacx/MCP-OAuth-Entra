@@ -5,8 +5,9 @@ using './main.bicep'
 
 param appName           = 'mcp-entra'
 param appServicePlanSku = 'B1'
-param tenantId          = 'YOUR_TENANT_ID'
-param clientId          = 'YOUR_CLIENT_ID'
+param tenantId                = 'YOUR_TENANT_ID'
+param clientId                = 'YOUR_CLIENT_ID'
+param deployingUserObjectId   = 'YOUR_OBJECT_ID'  // overridden by 01-Provision.ps1
 param instance          = 'https://login.microsoftonline.com/'
 param tags              = {
   Project: 'MCP-OAuth-Entra'

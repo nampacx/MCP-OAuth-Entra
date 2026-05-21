@@ -33,8 +33,16 @@ param clientId string
 @description('Entra ID authority instance URL.')
 param instance string = environment().authentication.loginEndpoint
 
+@description('Object ID of the principal running this deployment. Granted Key Vault Secrets Officer so the provisioning script can write the client secret without a separate role-assignment step.')
+param deployingUserObjectId string
+
 @description('Optional resource tags applied to all resources.')
 param tags object = {}
+
+// ── Variables ─────────────────────────────────────────────────────────────────
+
+// Key Vault name: 3–24 chars, alphanumeric + hyphens, globally unique.
+var kvName = take('${appName}-kv-${uniqueString(resourceGroup().id)}', 24)
 
 // ── App Service Plan (Linux) ──────────────────────────────────────────────────
 // AVM module: https://github.com/Azure/bicep-registry-modules/tree/main/avm/res/web/serverfarm
@@ -86,9 +94,39 @@ module webApp 'br/public:avm/res/web/site:0.13.3' = {
       AzureAd__Instance: instance
       AzureAd__TenantId: tenantId
       AzureAd__ClientId: clientId
+      // Resolved at runtime via the web app's system-assigned managed identity.
+      AzureAd__ClientSecret: '@Microsoft.KeyVault(VaultName=${kvName};SecretName=client-secret)'
       // Set to '1' so the app runs from the uploaded ZIP package.
       WEBSITE_RUN_FROM_PACKAGE: '1'
     }
+  }
+}
+
+// ── Key Vault ─────────────────────────────────────────────────────────────────
+// AVM module: https://github.com/Azure/bicep-registry-modules/tree/main/avm/res/key-vault/vault
+// Verify latest version before pinning.
+
+module keyVault 'br/public:avm/res/key-vault/vault:0.11.3' = {
+  name: 'keyVaultDeployment'
+  params: {
+    name: kvName
+    location: location
+    tags: tags
+    enablePurgeProtection: false
+    softDeleteRetentionInDays: 7
+    // Grant the web app's managed identity read access to secrets.
+    roleAssignments: [
+      {
+        principalId: webApp.outputs.?systemAssignedMIPrincipalId ?? ''
+        roleDefinitionIdOrName: 'Key Vault Secrets User'
+        principalType: 'ServicePrincipal'
+      }
+      {
+        principalId: deployingUserObjectId
+        roleDefinitionIdOrName: 'Key Vault Secrets Officer'
+        principalType: 'User'
+      }
+    ]
   }
 }
 
@@ -108,3 +146,6 @@ output prmUrl string = 'https://${webApp.outputs.defaultHostname}/.well-known/oa
 
 @description('Principal ID of the system-assigned managed identity.')
 output managedIdentityPrincipalId string = webApp.outputs.?systemAssignedMIPrincipalId ?? ''
+
+@description('Name of the Key Vault that stores the app registration client secret.')
+output keyVaultName string = keyVault.outputs.name

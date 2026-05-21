@@ -1,3 +1,4 @@
+using McpOAuthEntra.Services;
 using McpOAuthEntra.Tools;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
@@ -45,6 +46,7 @@ builder.Services
 
 builder.Services.AddAuthorization();
 builder.Services.AddHttpContextAccessor();
+builder.Services.AddScoped<GraphService>();
 
 // ── MCP server ───────────────────────────────────────────────────────────────
 builder.Services

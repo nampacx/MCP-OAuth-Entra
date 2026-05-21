@@ -20,6 +20,8 @@
       https://www.nuget.org/packages/ModelContextProtocol.AspNetCore
     -->
     <PackageReference Include="ModelContextProtocol.AspNetCore" Version="*-*" />
+    <PackageReference Include="Azure.Identity"  Version="1.*" />
+    <PackageReference Include="Microsoft.Graph"  Version="5.*" />
   </ItemGroup>
 
 </Project>

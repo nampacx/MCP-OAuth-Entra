@@ -7,7 +7,10 @@ Identity Passthrough lets an AI Foundry agent call downstream services **on beha
 1. ✅ Be a proper OAuth resource server (validate Bearer tokens issued by Entra ID)
 2. ✅ Advertise itself via [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource Metadata so clients can discover the correct authorization server
 
-This sample is the downstream service. It keeps things deliberately simple: an ASP.NET Core 9 app that exposes a single `get_user` MCP tool, which reads all claims from the forwarded JWT and returns them as a key-value map. That makes it easy to verify end-to-end that the right user identity is flowing through. 🎯
+This sample is the downstream service. It exposes two MCP tools:
+
+- **`get_user`** — returns all claims from the forwarded JWT as a key-value map, making it easy to verify that the right user identity is flowing through
+- **`get_graph_profile`** — exchanges the incoming token for a Graph-scoped token via the [OAuth 2.0 On-Behalf-Of flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-on-behalf-of-flow) and returns the user's Microsoft Graph profile
 
 ---
 
@@ -31,6 +34,8 @@ MCP Server ──► 401  WWW-Authenticate: Bearer resource_metadata=".../.well-
 MCP Server validates JWT ──► executes tool ──► returns result 🎉
 ```
 
+For `get_graph_profile` the server additionally performs an OBO exchange to acquire a Graph-scoped token before calling `GET /me`.
+
 ---
 
 ## 📁 Repository structure
@@ -42,7 +47,7 @@ MCP Server validates JWT ──► executes tool ──► returns result 🎉
 │   ├── 02-Deploy.ps1      # Build, package, and deploy the app to App Service
 │   └── 03-Cleanup.ps1     # Delete and purge all Azure resources
 ├── iac/
-│   ├── main.bicep                    # Linux App Service Plan + Web App (AVM)
+│   ├── main.bicep                    # App Service Plan + Web App + Key Vault (AVM)
 │   ├── foundry.bicep                 # AI Foundry account, project & model deployment
 │   ├── main.bicepparam               # Deployment parameters
 │   └── bicepconfig.json
@@ -50,25 +55,13 @@ MCP Server validates JWT ──► executes tool ──► returns result 🎉
 │   ├── McpOAuthEntra.sln
 │   └── McpOAuthEntra/
 │       ├── Program.cs                # Auth + MCP server
-│       ├── Tools/UserTool.cs         # get_user MCP tool
+│       ├── Services/GraphService.cs  # OBO flow → Microsoft Graph
+│       ├── Tools/UserTool.cs         # get_user + get_graph_profile MCP tools
 │       ├── Properties/launchSettings.json
 │       └── appsettings.json
 └── test/
-    └── Test-McpEndpoint.ps1          # End-to-end test (6 steps)
+    └── Test-McpEndpoint.ps1          # End-to-end test (6 steps, configurable tool)
 ```
-
----
-
-## 🛠️ Prerequisites
-
-| Tool | Minimum version |
-| ---- | --------------- |
-| .NET SDK | 9.0 |
-| Azure CLI | 2.65 |
-| Bicep CLI | 0.29 |
-| PowerShell | 7.3 |
-| Azure subscription | — |
-| Entra ID tenant | — |
 
 ---
 
@@ -88,14 +81,17 @@ The script is **idempotent** — safe to re-run after partial failures. It execu
 
 | Step | What happens |
 | ---- | ------------ |
-| 1 | 📋 Create / update the Entra ID app registration |
-| 2 | ⚙️ Configure v2 tokens, optional claims (`given_name`, `family_name`, `upn`), and required Graph permissions |
+| 1 | 📋 Create / update the Entra ID app registration and service principal |
+| 2 | ⚙️ Configure v2 tokens, optional claims (`given_name`, `family_name`, `upn`), Graph permissions (`openid`, `profile`, `email`, `User.Read`), and grant tenant-wide admin consent |
 | 3 | 🔑 Expose the `user_impersonation` delegated scope |
 | 4 | 💻 Pre-authorize the Azure CLI for frictionless local token acquisition |
-| 5 | ☁️ Create resource group and deploy Bicep (ClientId/TenantId injected automatically) |
-| 6 | 🤖 *(optional)* Deploy AI Foundry + Project + GPT-5.4 model to swedencentral (`-DeployFoundry`) |
+| 5 | ☁️ Deploy Bicep — App Service + Key Vault; ClientId/TenantId/deploying-user OID injected automatically |
+| 6 | 🔐 Create a 1-year client secret and store it in Key Vault (never printed to the console) |
+| 7 | 🤖 *(optional)* Deploy AI Foundry + Project + GPT-5.4 model to swedencentral (`-DeployFoundry`) |
 
-At the end the script prints your `TenantId`, `ClientId`, and ready-to-paste `dotnet user-secrets` commands. 🎁
+> ⚠️ **Admin consent** — step 2 attempts `az ad app permission admin-consent` automatically. If the caller lacks *Cloud Application Administrator* or higher, the command is skipped and a portal deep-link is printed. Without consent the OBO flow will fail with `AADSTS65001` at runtime.
+
+At the end the script prints your `TenantId`, `ClientId`, Key Vault name, and a ready-to-run command to load the client secret into `dotnet user-secrets`. 🎁
 
 ---
 
@@ -106,6 +102,10 @@ Set credentials via user-secrets (the commands are printed by `01-Provision.ps1`
 ```powershell
 dotnet user-secrets set "AzureAd:TenantId" "<tenant-id>" --project src/McpOAuthEntra
 dotnet user-secrets set "AzureAd:ClientId" "<client-id>" --project src/McpOAuthEntra
+
+# Read the client secret directly from Key Vault — value never appears on screen
+az keyvault secret show --vault-name '<kv-name>' --name 'client-secret' --query value -o tsv `
+    | dotnet user-secrets set "AzureAd:ClientSecret" --project src/McpOAuthEntra
 ```
 
 Run the server:
@@ -124,6 +124,8 @@ The MCP endpoint is live at `http://localhost:5000/mcp` ✨
 .\deploy\02-Deploy.ps1 -ResourceGroup 'rg-mcp-oauth-entra'
 ```
 
+In production the App Service reads `AzureAd:ClientSecret` from a Key Vault reference resolved via its system-assigned managed identity — no secrets in app settings or environment variables.
+
 ---
 
 ## 🧪 Step 4 — Test
@@ -131,11 +133,15 @@ The MCP endpoint is live at `http://localhost:5000/mcp` ✨
 With the server running, fire up the end-to-end test:
 
 ```powershell
+# Default: calls get_user
 .\test\Test-McpEndpoint.ps1 -ClientId '<client-id>' -TenantId '<tenant-id>'
 
-# Against the deployed App Service:
+# Call get_graph_profile instead
+.\test\Test-McpEndpoint.ps1 -ClientId '<client-id>' -TenantId '<tenant-id>' -ToolName 'get_graph_profile'
+
+# Against the deployed App Service
 .\test\Test-McpEndpoint.ps1 -ClientId '<client-id>' -TenantId '<tenant-id>' `
-    -ServerUrl 'https://<app>.azurewebsites.net'
+    -ServerUrl 'https://<app>.azurewebsites.net' -ToolName 'get_graph_profile'
 ```
 
 | Step | What's verified |
@@ -144,8 +150,8 @@ With the server running, fire up the end-to-end test:
 | 2 | 📄 `/.well-known/oauth-protected-resource` returns valid PRM JSON |
 | 3 | 🎫 `az account get-access-token` returns a Bearer token |
 | 4 | 🤝 MCP `initialize` handshake succeeds |
-| 5 | 🛠️ `tools/list` response includes `get_user` |
-| 6 | 👤 `tools/call get_user` returns the authenticated user's JWT claims |
+| 5 | 🛠️ `tools/list` response includes the requested tool |
+| 6 | 👤 `tools/call <tool>` returns the result |
 
 ---
 
@@ -161,13 +167,15 @@ To remove all Azure resources (and optionally the Entra ID app registration):
 .\deploy\03-Cleanup.ps1 -ResourceGroup 'rg-mcp-oauth-entra' -DeleteEntraApp
 ```
 
-The script prompts for confirmation before deleting anything and handles soft-delete purging for Cognitive Services accounts created by `-DeployFoundry`.
+The script prompts for confirmation, then removes resources in the correct order: Foundry resource group → purge Cognitive Services → main resource group → purge Key Vault → (optional) Entra ID app registration.
 
 ---
 
-## 🛠️ The `get_user` tool
+## 🛠️ MCP tools
 
-Returns all non-empty claims from the forwarded JWT as a key-value map. This is intentionally complete — when used with AI Foundry Identity Passthrough you can inspect exactly which claims arrive and use them in your agent logic. 🔍
+### `get_user`
+
+Returns all non-empty claims from the forwarded JWT as a key-value map. Useful for verifying end-to-end that the right user identity is flowing through.
 
 ```json
 {
@@ -182,6 +190,26 @@ Returns all non-empty claims from the forwarded JWT as a key-value map. This is 
 ```
 
 > 💡 **Personal Microsoft accounts** (live.com, outlook.com, etc.) do not populate `given_name` / `family_name` even with optional claims configured — only the `name` claim (full display name) is available.
+
+### `get_graph_profile`
+
+Exchanges the incoming Bearer token for a Graph-scoped token via the **OAuth 2.0 On-Behalf-Of flow**, then calls `GET /me` to return the user's Microsoft Graph profile.
+
+```json
+{
+  "displayName": "Jane Doe",
+  "userPrincipalName": "user@contoso.com",
+  "mail": "user@contoso.com",
+  "givenName": "Jane",
+  "surname": "Doe",
+  "jobTitle": "Engineer",
+  "department": "Platform",
+  "officeLocation": "Amsterdam",
+  "id": "..."
+}
+```
+
+The OBO flow requires the app registration's client secret, which is stored in Key Vault and injected into the App Service at runtime via a managed-identity Key Vault reference.
 
 ---
 
@@ -201,14 +229,22 @@ Connect your Foundry agent to the MCP server using **OAuth Identity Passthrough*
 
 ## 📦 Bicep IaC
 
-Uses [Azure Verified Modules (AVM)](https://azure.github.io/Azure-Verified-Modules/) from `mcr.microsoft.com/bicep/avm/res` for the App Service resources:
+Uses [Azure Verified Modules (AVM)](https://azure.github.io/Azure-Verified-Modules/) for all resources:
 
 | Module | Purpose |
 | ------ | ------- |
 | `avm/res/web/serverfarm` | Linux App Service Plan |
 | `avm/res/web/site` | Web App (DOTNETCORE 9.0) |
+| `avm/res/key-vault/vault` | Key Vault (stores the client secret) |
 
-Verify the pinned versions in [iac/main.bicep](iac/main.bicep) against the [AVM catalog](https://azure.github.io/Azure-Verified-Modules/indexes/bicep/bicep-resource-modules/) before deploying to production.
+The Key Vault `roleAssignments` in [iac/main.bicep](iac/main.bicep) grant two roles:
+
+| Principal | Role |
+| --------- | ---- |
+| Web App system-assigned MI | `Key Vault Secrets User` — read secrets at runtime |
+| Deploying user (OID injected by script) | `Key Vault Secrets Officer` — write the client secret during provisioning |
+
+Verify the pinned module versions against the [AVM catalog](https://azure.github.io/Azure-Verified-Modules/indexes/bicep/bicep-resource-modules/) before deploying to production.
 
 ---
 
@@ -216,6 +252,8 @@ Verify the pinned versions in [iac/main.bicep](iac/main.bicep) against the [AVM 
 
 - HTTPS-only enforced at App Service level and via `UseHttpsRedirection()`
 - FTPS disabled, minimum TLS 1.2
-- System-assigned managed identity enabled for future Key Vault integration
+- Client secret stored in Key Vault; injected via App Service Key Vault reference — never in app settings or environment variables in plain text
+- System-assigned managed identity used for Key Vault access — no credential management required in production
+- OBO flow exchanges the user's incoming token for a narrowly scoped Graph token — the client secret never leaves the server
 - Both v1 (`sts.windows.net`) and v2 (`login.microsoftonline.com`) token issuers accepted
-- `appsettings.Development.json` is git-ignored — use `dotnet user-secrets` for local credentials
+- `AzureAd:ClientSecret` for local development is loaded from Key Vault via `az keyvault secret show` and stored in `dotnet user-secrets` — never committed to source control

@@ -1,15 +1,15 @@
 #Requires -Version 7.3
 <#
 .SYNOPSIS
-    End-to-end test of the MCP server's get_user tool.
+    End-to-end test of the MCP server.
 
 .DESCRIPTION
     1. Acquires a Bearer token via the Azure CLI
     2. Verifies the unauthenticated flow returns 401 with the expected WWW-Authenticate header
     3. Verifies the Protected Resource Metadata endpoint
     4. Sends an MCP initialize handshake
-    5. Lists available tools and asserts get_user is present
-    6. Calls get_user and prints the result
+    5. Lists available tools and asserts the requested tool is present
+    6. Calls the tool and prints the result
 
 .PARAMETER ServerUrl
     Base URL of the running MCP server. Defaults to http://localhost:5000.
@@ -20,13 +20,19 @@
 .PARAMETER TenantId
     Entra ID Tenant (Directory) ID.
 
+.PARAMETER ToolName
+    Name of the MCP tool to invoke in step 6. Defaults to 'get_user'.
+
 .EXAMPLE
     .\test\Test-McpEndpoint.ps1 -ClientId '<client-id>' -TenantId '<tenant-id>'
 
 .EXAMPLE
+    .\test\Test-McpEndpoint.ps1 -ClientId '<client-id>' -TenantId '<tenant-id>' -ToolName 'get_graph_profile'
+
+.EXAMPLE
     # Against the deployed App Service
     .\test\Test-McpEndpoint.ps1 -ClientId '<client-id>' -TenantId '<tenant-id>' `
-        -ServerUrl 'https://<app>.azurewebsites.net'
+        -ServerUrl 'https://<app>.azurewebsites.net' -ToolName 'get_graph_profile'
 #>
 
 [CmdletBinding()]
@@ -37,7 +43,9 @@ param(
     [string] $ClientId,
 
     [Parameter(Mandatory)]
-    [string] $TenantId
+    [string] $TenantId,
+
+    [string] $ToolName = 'get_user'
 )
 
 Set-StrictMode -Version Latest
@@ -110,6 +118,7 @@ Write-Host ""
 Write-Host "  MCP server : $mcpUrl"
 Write-Host "  ClientId   : $ClientId"
 Write-Host "  TenantId   : $TenantId"
+Write-Host "  Tool       : $ToolName"
 
 # ── 1. Unauthenticated request must return 401 ────────────────────────────────
 
@@ -204,7 +213,7 @@ Write-Pass "Initialized — server: $($init.result.serverInfo.name) $($init.resu
 
 # ── 5. List tools and assert get_user is present ──────────────────────────────
 
-Write-Step "5/6  tools/list — asserting 'get_user' is available"
+Write-Step "5/6  tools/list — asserting '$ToolName' is available"
 
 $toolList = Invoke-Mcp @{
     Uri         = $mcpUrl
@@ -214,21 +223,22 @@ $toolList = Invoke-Mcp @{
     Body        = '{"jsonrpc":"2.0","method":"tools/list","id":2}'
 }
 
-$getUserTool = $toolList.result.tools | Where-Object { $_.name -eq 'get_user' }
-if (-not $getUserTool) {
-    Write-Fail "Tool 'get_user' not found in tools/list response"
+$tool = $toolList.result.tools | Where-Object { $_.name -eq $ToolName }
+if (-not $tool) {
+    $available = ($toolList.result.tools | ForEach-Object { $_.name }) -join ', '
+    Write-Fail "Tool '$ToolName' not found. Available tools: $available"
 }
 
-Write-Pass "'get_user' found — description: $($getUserTool.description)"
+Write-Pass "'$ToolName' found — description: $($tool.description)"
 
-# ── 6. Call get_user and print the result ─────────────────────────────────────
+# ── 6. Call the tool and print the result ─────────────────────────────────────
 
-Write-Step "6/6  tools/call get_user"
+Write-Step "6/6  tools/call $ToolName"
 
 $callBody = @{
     jsonrpc = '2.0'
     method  = 'tools/call'
-    params  = @{ name = 'get_user'; arguments = @{} }
+    params  = @{ name = $ToolName; arguments = @{} }
     id      = 3
 } | ConvertTo-Json -Depth 5
 
@@ -240,14 +250,8 @@ $callResult = Invoke-Mcp @{
     Body        = $callBody
 }
 
-Write-Pass "get_user returned:"
+Write-Pass "$ToolName returned:"
 Write-Host ""
-$callResult.result.content | ForEach-Object {
-    if ($_.type -eq 'text') {
-        ($_.text | ConvertFrom-Json).PSObject.Properties |
-            Sort-Object Name |
-            ForEach-Object { Write-Host ("    {0,-55} {1}" -f $_.Name, $_.Value) }
-    }
-}
+Write-Host ($callResult.result.content | ConvertTo-Json -Depth 10)
 Write-Host ""
 Write-Host "  All tests passed." -ForegroundColor Green

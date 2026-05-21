@@ -51,7 +51,7 @@ param(
     [string] $DisplayName          = 'MCP OAuth Entra',
     [string] $ResourceGroup        = 'rg-mcp-oauth-entra',
     [string] $Location             = 'westeurope',
-    [string] $AppName              = 'npx-mcp-entra',
+    [string] $AppName              = 'mk-mcp',
     [string] $AppServicePlanSku    = 'B1',
     [string] $SignInAudience       = 'AzureADMyOrg',
     [switch] $DeployFoundry,
@@ -75,7 +75,7 @@ if ($DeployFoundry -and -not (Test-Path $foundryBicepFile)) {
     throw "Foundry Bicep template not found: $foundryBicepFile"
 }
 
-$totalSteps = if ($DeployFoundry) { 6 } else { 5 }
+$totalSteps = if ($DeployFoundry) { 7 } else { 6 }
 
 # ── 1. Create / update app registration ──────────────────────────────────────
 
@@ -91,6 +91,16 @@ $objectId = $app.id
 $tenantId = az account show --query tenantId -o tsv
 
 Write-OK "ClientId = $clientId   TenantId = $tenantId"
+
+# A service principal must exist before admin consent can be granted.
+az ad sp show --id $clientId -o none 2>$null
+if ($LASTEXITCODE -ne 0) {
+    az ad sp create --id $clientId -o none
+    Write-OK 'Service principal created.'
+}
+else {
+    Write-Skip 'Service principal already exists — skipping.'
+}
 
 # ── 2. Configure token version, optional claims, Graph permissions ────────────
 
@@ -118,6 +128,7 @@ $configBody = @{
                 @{ id = '37f7f235-527c-4136-accd-4a02d197296e'; type = 'Scope' }  # openid
                 @{ id = '14dad69e-099b-42c9-810b-d002981feec1'; type = 'Scope' }  # profile
                 @{ id = '64a6cdd6-aab1-4aaf-94b8-3cc8405e90d6'; type = 'Scope' }  # email
+                @{ id = 'e1fe6dd8-ba31-4d61-89e7-88639da4683d'; type = 'Scope' }  # User.Read
             )
         }
     )
@@ -126,7 +137,20 @@ $configBody = @{
 Invoke-RestMethod -Method PATCH -Uri $graphUri -Headers $graphHeaders `
     -ContentType 'application/json' -Body $configBody | Out-Null
 
-Write-OK 'Token v2, optional claims (given_name, family_name, upn), Graph openid/profile/email.'
+Write-OK 'Token v2, optional claims (given_name, family_name, upn), Graph openid/profile/email/User.Read.'
+
+# Grant tenant-wide admin consent so the OBO flow can exchange tokens for Graph
+# without an interactive consent prompt (AADSTS65001). Requires Cloud Application
+# Administrator or higher. Falls back to a portal link if the caller lacks the role.
+az ad app permission admin-consent --id $clientId -o none 2>$null
+if ($LASTEXITCODE -eq 0) {
+    Write-OK 'Admin consent granted for Graph permissions.'
+}
+else {
+    Write-Skip 'Admin consent could not be granted automatically — insufficient privileges or propagation delay.'
+    Write-Skip "  Grant it in the portal: https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/CallAnAPI/appId/$clientId"
+    Write-Skip '  Without consent the OBO flow will fail with AADSTS65001 at runtime.'
+}
 
 # ── 3. Expose user_impersonation scope ────────────────────────────────────────
 
@@ -203,14 +227,17 @@ Write-Step "5/$totalSteps  Deploying Azure infrastructure to '$ResourceGroup' ($
 
 az group create --name $ResourceGroup --location $Location | Out-Null
 
-# ClientId and TenantId are injected as overrides — main.bicepparam placeholders
-# are not required to be filled in before running this script.
+$deployingUserObjectId = az ad signed-in-user show --query id -o tsv
+
+# ClientId, TenantId, and the deploying user's OID are injected as overrides —
+# main.bicepparam placeholders are not required to be filled in before running this script.
 az deployment group create `
     --resource-group $ResourceGroup `
     --template-file  $bicepFile `
     --parameters     $paramsFile `
     --parameters     "tenantId=$tenantId" "clientId=$clientId" `
                      "appName=$AppName"   "appServicePlanSku=$AppServicePlanSku" `
+                     "deployingUserObjectId=$deployingUserObjectId" `
     -o none
 
 $outputs = az deployment group show `
@@ -222,10 +249,48 @@ $outputs = az deployment group show `
 
 Write-OK "App Service deployed: $($outputs.webAppHostname.value)"
 
-# ── 6. Deploy Azure AI Foundry (optional) ─────────────────────────────────────
+# ── 6. Create client secret and store in Key Vault ────────────────────────────
+
+Write-Step "6/$totalSteps  Creating and storing client secret in Key Vault"
+
+# Re-acquire a fresh Graph token — the earlier one may have expired during deployment.
+$graphToken   = az account get-access-token --resource 'https://graph.microsoft.com' --query accessToken -o tsv
+$graphHeaders = @{ Authorization = "Bearer $graphToken" }
+
+$secretBody = @{
+    passwordCredential = @{
+        displayName = 'MCP OAuth Entra – provisioned'
+        endDateTime = (Get-Date).AddYears(1).ToString('o')
+    }
+} | ConvertTo-Json -Depth 3
+
+$secretResult = Invoke-RestMethod -Method POST `
+    -Uri "https://graph.microsoft.com/v1.0/applications/$objectId/addPassword" `
+    -Headers $graphHeaders `
+    -ContentType 'application/json' `
+    -Body $secretBody
+
+$clientSecret = $secretResult.secretText
+
+# RBAC assignments can take up to ~60 s to propagate; retry until the write succeeds.
+for ($attempt = 1; $attempt -le 5; $attempt++) {
+    az keyvault secret set `
+        --vault-name $outputs.keyVaultName.value `
+        --name       'client-secret' `
+        --value      $clientSecret `
+        -o none
+    if ($LASTEXITCODE -eq 0) { break }
+    if ($attempt -eq 5) { throw "az keyvault secret set failed after 5 attempts." }
+    Write-Skip "RBAC not yet propagated — retrying in 20 s ($attempt/5)..."
+    Start-Sleep -Seconds 20
+}
+
+Write-OK "Secret stored in Key Vault '$($outputs.keyVaultName.value)' (expires $((Get-Date).AddYears(1).ToString('yyyy-MM-dd')))."
+
+# ── 7. Deploy Azure AI Foundry (optional) ─────────────────────────────────────
 
 if ($DeployFoundry) {
-    Write-Step "6/$totalSteps  Deploying Azure AI Foundry to '$FoundryResourceGroup' (swedencentral)"
+    Write-Step "7/$totalSteps  Deploying Azure AI Foundry to '$FoundryResourceGroup' (swedencentral)"
 
     az group create --name $FoundryResourceGroup --location swedencentral | Out-Null
 
@@ -260,6 +325,7 @@ Write-Host ''
 Write-Host '  Azure'
 Write-Host "    Resource group : $ResourceGroup ($Location)"
 Write-Host "    App name       : $($outputs.webAppName.value)"
+Write-Host "    Key Vault      : $($outputs.keyVaultName.value)"
 Write-Host ''
 Write-Host '  Endpoints'
 Write-Host "    MCP            : $($outputs.mcpEndpointUrl.value)"
@@ -281,7 +347,8 @@ Write-Host "    Refresh URL  : $instance/$tenantId/oauth2/v2.0/token"
 Write-Host "    Scopes       : api://$clientId/user_impersonation"
 Write-Host ''
 Write-Host '  Local development — set user-secrets:'
-Write-Host "    dotnet user-secrets set ""AzureAd:TenantId"" ""$tenantId"" --project src/McpOAuthEntra"
-Write-Host "    dotnet user-secrets set ""AzureAd:ClientId"" ""$clientId"" --project src/McpOAuthEntra"
+Write-Host "    dotnet user-secrets set ""AzureAd:TenantId""     ""$tenantId""     --project src/McpOAuthEntra"
+Write-Host "    dotnet user-secrets set ""AzureAd:ClientId""     ""$clientId""     --project src/McpOAuthEntra"
+Write-Host "    az keyvault secret show --vault-name '$($outputs.keyVaultName.value)' --name 'client-secret' --query value -o tsv | dotnet user-secrets set ""AzureAd:ClientSecret"" --project src/McpOAuthEntra"
 Write-Host ''
 Write-Host "  Next step: .\deploy\02-Deploy.ps1 -ResourceGroup '$ResourceGroup'" -ForegroundColor Yellow
